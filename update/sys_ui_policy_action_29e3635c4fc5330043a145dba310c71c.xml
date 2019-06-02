@@ -1,0 +1,23 @@
+<?xml version="1.0" encoding="UTF-8"?><record_update table="sys_ui_policy_action">
+    <sys_ui_policy_action action="INSERT_OR_UPDATE">
+        <cleared>true</cleared>
+        <disabled>ignore</disabled>
+        <field>short_description</field>
+        <mandatory>ignore</mandatory>
+        <sys_class_name>sys_ui_policy_action</sys_class_name>
+        <sys_created_by>admin</sys_created_by>
+        <sys_created_on>2019-04-22 19:04:51</sys_created_on>
+        <sys_id>29e3635c4fc5330043a145dba310c71c</sys_id>
+        <sys_mod_count>0</sys_mod_count>
+        <sys_name>short_description</sys_name>
+        <sys_package display_value="NeedIt" source="x_58872_needit">6ead8e780f603200cd674f8ce1050ed1</sys_package>
+        <sys_policy/>
+        <sys_scope display_value="NeedIt">6ead8e780f603200cd674f8ce1050ed1</sys_scope>
+        <sys_update_name>sys_ui_policy_action_29e3635c4fc5330043a145dba310c71c</sys_update_name>
+        <sys_updated_by>admin</sys_updated_by>
+        <sys_updated_on>2019-04-22 19:04:51</sys_updated_on>
+        <table>x_58872_needit_needit</table>
+        <ui_policy display_value="test">64b32bd84fc5330043a145dba310c755</ui_policy>
+        <visible>ignore</visible>
+    </sys_ui_policy_action>
+</record_update>
