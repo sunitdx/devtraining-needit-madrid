@@ -1,0 +1,520 @@
+<?xml version="1.0" encoding="UTF-8"?><record_update table="sys_script_include">
+    <sys_script_include action="INSERT_OR_UPDATE">
+        <access>package_private</access>
+        <active>false</active>
+        <api_name>x_58872_needit.cds_utils</api_name>
+        <caller_access/>
+        <client_callable>false</client_callable>
+        <description/>
+        <name>cds_utils</name>
+        <script><![CDATA[var cs_cds_utils = Class.create();
+cs_cds_utils.prototype = {
+	initialize: function () {
+	},
+
+	removeAllSupportTiers: function (options) {
+		var that = this;
+		var firstAttempt = this.getFirstAttemptTimeout();
+		var response = {
+			grTask: options.grTask,
+			retried: options.retried
+		};
+		var domain = this.getUserAccountDomain(options.user.u_sam_account_name);
+		this.setTaskInProgress(options.grTask);
+		if (!domain) {			
+			response.error = 'User does not have a valid domain';
+			response.retried = true;
+			return response;
+		}        
+		if (domain) {
+			var groups = this.getGroupsAndDomain(domain);
+
+			var allProcessId = [];			
+			var failureResponse = '';
+			groups.forEach(function (item) {
+				that.executeProcess({
+					operation: 'Remove',
+					domain: item.domain,
+					member: options.user.u_sam_account_name,
+					group: item.group,
+					grTask: options.grTask
+				}, function (response, grTask, operation) {
+					var procesId = that.getProcessId(response);					
+					failureResponse = response;
+					if (procesId) {
+						allProcessId.push(procesId);
+					}
+					that.logRequest({
+						processId: procesId,
+						taskId: grTask.sys_id + '',
+						processState: procesId ? 'Initial' : 'Failed',
+						payload: response,
+						attempts: 0,
+						operation: operation
+					});                    
+				});
+			});
+		
+			if(allProcessId.length < 3){				
+				response.error = failureResponse;
+				return response;							
+			}
+			else{
+				return response;
+			}
+		}
+	},
+
+	retryRemoveAllSupportTiers: function (options) {
+		var taskId = options.grTask.sys_id + '';
+		var grLog = new GlideRecord('u_cs_cds_request_logs');
+		grLog.addQuery('u_process_state', 'Failed');
+		grLog.addQuery('u_catalog_task', taskId);
+		grLog.query();
+		while (grLog.next()) {
+			grLog.u_process_state = 'Retried';
+			grLog.u_is_processed = true;
+			grLog.update();
+		}
+		var response = this.removeAllSupportTiers(options);
+		return response;
+	},
+
+	executeProcess: function (options, cb) {
+		try {
+			var s = new SOAPMessage('CDS connection', 'ExecuteProcess');
+			s.setParameter('operation', options.operation);
+			s.setParameter('domain', options.domain);
+			s.setParameter('member', options.member);
+			s.setParameter('group', options.group);
+			var sm = new SOAPMutualMessage(s);
+			var waitCount = 1;
+			var statusCode = sm.post();
+			var response = sm.getResponse();
+			while (response == null && waitCount <= 20) {
+				response = sm.getResponse(1000);
+				waitCount++;
+			}
+			if (!response) {
+				response = statusCode;
+			}
+			if (typeof cb === 'function') {
+				cb(response, options.grTask, options.operation);
+			}
+		} catch (ex) {
+			gs.error(ex.message, 'global.cs_cds_utils');
+		}
+	},
+
+	logRequest: function (options) {        
+		var grLog = new GlideRecord('u_cs_cds_request_logs');
+		grLog.addQuery('u_process_id', options.processId);
+		grLog.addQuery('u_catalog_task', options.taskId);
+		grLog.query();
+		if (grLog.next()) {
+			grLog.u_process_state = grLog.u_process_state !== 'Retried' ? options.processState : grLog.u_process_state;
+			grLog.u_attempts = options.attempts;
+			grLog.u_payload = options.payload;
+			grLog.update();
+		} else {
+			this.createRequestLog(options);
+		}
+		this.updateTaskHistory({
+			payload: options.payload,
+			taskId: options.taskId
+		});
+	},
+
+	scheduleProcessStateRequest: function (options) {
+		var now = new GlideDateTime();
+		var seconds = options.seconds || this.getFirstAttemptTimeout() || 300;
+		now.addSeconds(seconds);
+		gs.eventQueueScheduled('cs.smo.cds.pending.process.state', options.grTask, '', '', now);
+	},
+
+	getProcessId: function (payload) {
+		return gs.getXMLText(payload, '//Body/ExecuteProcessResponse/ExecuteProcessResult/ProcessRequestId');
+	},
+
+	getProcessStateValue: function (payload) {
+		return gs.getXMLText(payload, '//Body/GetProcessStateResponse/GetProcessStateResult/ProcessState');
+	},
+
+	getAllProcessStateByTask: function (grTask) {
+		var that = this;
+		var grCDSLog = new GlideRecord('u_cs_cds_request_logs');
+		var taskId = grTask ? grTask.sys_id + '' : '';
+		if (grTask) {
+			grCDSLog.addQuery('u_catalog_task', taskId);
+		}
+		grCDSLog.addQuery('u_process_state', 'IN', 'Initial,Processing');
+		var now = new GlideDateTime();
+		var maxProcessedDate = this.getMaxProcessedDate();
+		grCDSLog.addQuery('sys_created_on', '<=', now);
+		grCDSLog.addQuery('sys_created_on', '>=', maxProcessedDate);        
+		grCDSLog.query();
+		while (grCDSLog.next()) {
+			var attempts = parseInt(grCDSLog.getValue('u_attempts')) + 1;
+			this.getProcessState(grCDSLog.getValue('u_process_id'), grCDSLog.u_catalog_task.sys_id, attempts, function (options) {
+				that.logRequest(options);
+			});
+		}
+		// fire an event to check for failed processes        
+		this.updateFailedTasks(taskId);
+		this.sendAddRequest();
+		this.updateCompletedRequests();
+		this.updateExpiredRequests();
+	},
+
+	getCompletedRequest: function () {
+		var grCDSLog = new GlideAggregate('u_cs_cds_request_logs');
+		var now = new GlideDateTime();
+		var maxProcessedDate = this.getMaxProcessedDate();
+		grCDSLog.addQuery('sys_created_on', '<=', now);
+		grCDSLog.addQuery('sys_created_on', '>=', maxProcessedDate);
+		grCDSLog.addQuery('u_process_operation', 'Add');
+		grCDSLog.addQuery('u_catalog_task.state', 2);
+		grCDSLog.addQuery('u_process_state', 'Completed');
+		grCDSLog.query();
+		var completedTasks = [];
+		while (grCDSLog.next()) {
+			var taskId = grCDSLog.u_catalog_task.sys_id + '';
+			completedTasks.push(taskId);
+		}        
+		return completedTasks;
+	},
+
+	updateCompletedRequests: function () {
+		var completedTasks = this.getCompletedRequest();        
+		var total = completedTasks.length;        
+		for(var i = 0; i < total; i++) {
+			var grTask = new GlideRecord('sc_task');
+			grTask.get(completedTasks[i]);
+			grTask.state = 3;
+			grTask.comments = 'Completing - successful integration process';
+			grTask.update();
+			this.setLogAsProcessed(completedTasks[i]);
+		}
+	},
+
+	getTaskGlideRecord: function (taskSysId) {
+		var grTaskRecord = new GlideRecord('sc_task');
+		grTaskRecord.get(taskSysId);
+		return grTaskRecord;
+	},
+
+	updateFailedTasks: function (taskId) {
+		var grCDSLog = new GlideAggregate('u_cs_cds_request_logs');
+		grCDSLog.addQuery('u_process_state', 'IN', 'Failed');
+		grCDSLog.addQuery('u_is_processed', false);
+		if (taskId) {
+			grCDSLog.addQuery('u_catalog_task', taskId);
+		}
+		var now = new GlideDateTime();
+		var maxProcessedDate = this.getMaxProcessedDate();
+		grCDSLog.addQuery('sys_created_on', '<=', now);
+		grCDSLog.addQuery('sys_created_on', '>=', maxProcessedDate);
+		grCDSLog.groupBy('u_catalog_task');
+		grCDSLog.query();
+		while (grCDSLog.next()) {			
+			var grTaskRequest = new GlideRecord('sc_task');
+			grTaskRequest.get(grCDSLog.u_catalog_task.sys_id + '');
+			grTaskRequest.comments = 'Process has failed'; //need to change 
+			grTaskRequest.update();
+			this.setLogAsProcessed(grCDSLog.u_catalog_task.sys_id + '');
+			this.createIncident(grTaskRequest, grCDSLog.u_payload);
+		}
+	},
+	
+	setLogAsProcessed: function (taskId) {
+		var grCDSLog = new GlideRecord('u_cs_cds_request_logs');
+		grCDSLog.addQuery('u_catalog_task', taskId);
+		grCDSLog.query();
+		while(grCDSLog.next()) {
+			grCDSLog.u_is_processed = true;
+			grCDSLog.update();
+		}
+	},
+
+	getMultiStateTasks: function () {
+		var grCDSLog = new GlideAggregate('u_cs_cds_request_logs');
+		var now = new GlideDateTime();
+		var maxProcessedDate = this.getMaxProcessedDate();
+		grCDSLog.addQuery('sys_created_on', '<=', now);
+		grCDSLog.addQuery('sys_created_on', '>=', maxProcessedDate);
+		grCDSLog.addQuery('u_catalog_task.state', 2);
+		grCDSLog.addQuery('u_process_state', '!=', 'Retried');
+		grCDSLog.groupBy('u_catalog_task');
+		grCDSLog.groupBy('u_process_state');
+		grCDSLog.groupBy('u_process_operation');
+		grCDSLog.orderBy('u_catalog_task');
+		grCDSLog.orderBy('u_process_state');
+		grCDSLog.orderBy('u_process_operation');
+		grCDSLog.query();
+		var previousTaskId;
+		var previousState;
+		var previousOperation;
+		var duplicatedTasks = [];
+		while (grCDSLog.next()) {
+			var currentTaskId = grCDSLog.u_catalog_task.sys_id + '';
+			var currentState = grCDSLog.u_process_state + '';
+			var currentOperation = grCDSLog.u_process_operation + '';
+			if (previousTaskId && previousTaskId === currentTaskId) {
+				if ((previousState && previousState !== currentState) || (previousOperation && previousOperation !== currentOperation)) {
+					duplicatedTasks.push(currentTaskId);
+				}
+			}
+			previousTaskId = currentTaskId;
+			previousState = currentState;
+			previousOperation = currentOperation;
+		}
+		return duplicatedTasks;
+	},
+
+	getCompletedTask: function (operation) {
+		var multiStateTasks = this.getMultiStateTasks();
+		var grCDSLog = new GlideAggregate('u_cs_cds_request_logs');
+		var now = new GlideDateTime();
+		var maxProcessedDate = this.getMaxProcessedDate();
+		grCDSLog.addQuery('sys_created_on', '<=', now);
+		grCDSLog.addQuery('sys_created_on', '>=', maxProcessedDate);
+		grCDSLog.addQuery('u_process_operation', operation);
+		grCDSLog.addQuery('u_catalog_task.sys_id', 'NOT IN', multiStateTasks.join(','));
+		grCDSLog.addQuery('u_catalog_task.state', 2);
+		grCDSLog.addQuery('u_process_state', 'Completed');
+		grCDSLog.groupBy('u_catalog_task');
+		grCDSLog.groupBy('u_process_state');        
+		grCDSLog.orderBy('u_catalog_task');
+		grCDSLog.query();
+		var completedTasks = [];
+		while (grCDSLog.next()) {
+			var taskId = grCDSLog.u_catalog_task.sys_id + '';
+			completedTasks.push(taskId);
+		}
+		return completedTasks;
+	},
+
+	getTaskVariables: function (taskId) {
+		var grTask = new GlideRecord('sc_task');
+		grTask.get(taskId);
+		return {
+			supportTier: grTask.variables.requested_support_tier.value,
+			userLoginId: grTask.variables.RequestedFor.u_sam_account_name
+		};
+	},
+
+	sendAddRequest: function () {
+		var completedTasks = this.getCompletedTask('Remove');
+		var total = completedTasks.length;
+
+		var that = this;
+		for (var i = 0; i < total; i++) {
+			var taskVariables = this.getTaskVariables(completedTasks[i]);
+			var userAccountDomain = this.getUserAccountDomain(taskVariables.userLoginId);
+			var groupAndDomain = this.getGroupAndDomainByTier(userAccountDomain, taskVariables.supportTier);
+			var firstAttempt = this.getFirstAttemptTimeout();
+			this.scheduleProcessStateRequest({ seconds: firstAttempt, grTask: this.getTaskGlideRecord(completedTasks[i]) });
+			if (groupAndDomain && groupAndDomain.group && groupAndDomain.domain) {
+				that.executeProcess({
+					operation: 'Add',
+					domain: groupAndDomain.domain,
+					member: taskVariables.userLoginId,
+					group: groupAndDomain.group,
+					grTask: completedTasks[i]
+				}, function (response, taskId, operation) {                    
+					that.logRequest({
+						processId: that.getProcessId(response),
+						taskId: taskId,
+						processState: 'Initial',
+						payload: response,
+						attempts: 0,
+						operation: operation
+					});
+				});
+			}
+		}
+	},
+
+	getProcessState: function (processId, taskId, attempts, cb) {
+		try {
+			var s = new SOAPMessage('CDS connection', 'GetProcessState');
+			s.setParameter('processId', processId);
+			s.setParameter('contentType', 'application/soap+xml; charset=utf-8');
+			var sm = new SOAPMutualMessage(s);
+			var waitCount = 1;
+			var statusCode = sm.post();
+			var response = sm.getResponse();
+			while (response == null && waitCount <= 20) {
+				response = sm.getResponse(1000);
+				waitCount++;
+			}
+			if (response) {
+				if (typeof cb === 'function') {
+					cb({
+						processId: processId,
+						taskId: taskId,
+						processState: this.getProcessStateValue(response),
+						attempts: attempts,
+						payload: response
+					});
+				}
+			} else {
+				var grTask = this.getTaskGlideRecord(taskId);                
+				this.createIncident(grTask, statusCode);
+			}
+		} catch (ex) {
+			gs.error(ex.message, 'global.cs_cds_utils');
+		}
+	},
+
+	scheduleProcessRetry: function (options) {		
+		var now = new GlideDateTime();
+		var seconds = options.seconds || gs.getProperty('cs.smo.cds.get.process.state.secondAttempt.timeout') || 14400;
+		now.addSeconds(seconds);
+		gs.eventQueueScheduled('cs.smo.cds.process.retry', options.grTask, '', '', now);
+	},
+
+	createIncident: function (grTask, payload, options) {
+		try {
+			var userID = grTask.variables.RequestedFor + '';
+			var grINC = new GlideRecord('incident');
+			grINC.initialize();
+			grINC.opened_by = userID;
+			grINC.caller_id = userID;
+			grINC.cmdb_ci = options.cmdbCi || gs.getProperty('cs.cds.ci');
+			grINC.category = 'Application Issue';
+			grINC.subcategory = 'Application Error';
+			grINC.u_environment = options.environment || 'PROD';
+			grINC.assignment_group = options.group || gs.getProperty('cs.cds.assignmentGroup');
+			grINC.u_owning_group = options.group || gs.getProperty('cs.cds.assignmentGroup');
+			grINC.short_description = grTask.request.description + ' has encountered issues';
+			grINC.description = 'An error message was returned when fulfilling TASK: ' + grTask.getDisplayValue() + ' \n \n Failure reason / payload (if any) \n \n' + payload ;
+			grINC.contact_type = options.contactType || 'SNOW';
+			grINC.u_source_type = options.sourceType || 'Automatic';
+			grINC.parent = grTask.sys_id + '';
+			grINC.insert();
+		} catch (ex) {
+			gs.error('createIncident ERROR: ' + ex, 'global.cs_cds_utils');
+		}
+	},
+
+	getUserAccountDomain: function (userLogin) {
+		var grUserAccount = new GlideRecord('u_user_account');
+		grUserAccount.addQuery('u_is_primary', true);
+		grUserAccount.addQuery('u_login_id', userLogin);
+		grUserAccount.query();
+		if (grUserAccount.next()) {
+			return grUserAccount.u_domain;
+		}
+	},
+
+	getGroupsAndDomain: function (domain) {
+		var groups = [];
+		var grGroups = new GlideRecord('u_cs_cds_groups_by_domain');
+		grGroups.addQuery('u_user_account_domain', domain);
+		grGroups.query();
+		while (grGroups.next()) {
+			groups.push({
+				group: grGroups.u_ad_group_name.toString(),
+				domain: grGroups.u_domain_name.toString(),
+			});
+		}
+		return groups;
+	},
+
+	getGroupAndDomainByTier: function (domain, tier) {
+		var group = {};
+		var grGroups = new GlideRecord('u_cs_cds_groups_by_domain');
+		grGroups.addQuery('u_user_account_domain', domain);
+		grGroups.addQuery('u_support_tier', tier);
+		grGroups.query();
+		if (grGroups.next()) {
+			group = {
+				group: grGroups.u_ad_group_name.toString(),
+				domain: grGroups.u_domain_name.toString(),
+			};
+		}
+		return group;
+	},
+
+	getFirstAttemptTimeout: function () {
+		return gs.getProperty('cs.smo.cds.get.process.state.firstAttempt.timeout', 300).replace(/ /g, '');
+	},
+
+	createRequestLog: function (options) {
+		var grNewLog = new GlideRecord('u_cs_cds_request_logs');
+		grNewLog.initialize();
+		grNewLog.u_process_id = options.processId;
+		grNewLog.u_catalog_task = options.taskId;
+		grNewLog.u_process_state = options.processState;
+		grNewLog.u_process_operation = options.operation;
+		grNewLog.u_attempts = options.attempts;
+		grNewLog.u_payload = options.payload;
+		grNewLog.insert();
+	},
+
+	updateTaskHistory: function (options) {
+		var grTask = new GlideRecord('sc_task');
+		grTask.get(options.taskId);
+		grTask.comments = options.payload;        
+		grTask.update();
+	},
+
+	setTaskInProgress: function (grTask) {
+		grTask.state = 2;        
+		grTask.update();
+	},
+
+	displayTriggerAutomationButton: function (taskId) {
+		var grIncident = new GlideRecord('incident');
+		grIncident.addQuery('parent', taskId);
+		grIncident.orderByDesc('sys_created_on');
+		grIncident.setLimit(1);
+		grIncident.query();
+		while (grIncident.next()) {
+			return (grIncident.incident_state == '4' || grIncident.incident_state == '7' || grIncident.incident_state == '8') ? true : false;
+		}
+	},
+
+	getMaxProcessedDate: function () {
+		var maxProcessingTime = -1 * parseInt(gs.getProperty('cs.smo.cds.maxProcessingTime', 14)); // number of days
+		var now = new GlideDateTime();
+		now.addDaysUTC(maxProcessingTime);
+		return now;        
+	},
+
+	updateExpiredRequests: function () {
+		var grCDSLog = new GlideAggregate('u_cs_cds_request_logs');
+		grCDSLog.addQuery('u_process_state', 'IN', 'Processing');
+		grCDSLog.addQuery('u_catalog_task.state', 2);        
+		var now = new GlideDateTime();
+		var maxProcessedDate = this.getMaxProcessedDate();
+		grCDSLog.addQuery('sys_created_on', '<=', maxProcessedDate);
+		grCDSLog.groupBy('u_catalog_task');
+		grCDSLog.query();
+		while (grCDSLog.next()) {
+			var grTaskRequest = new GlideRecord('sc_task');
+			grTaskRequest.get(grCDSLog.u_catalog_task.sys_id + '');
+			grTaskRequest.comments = 'Process has expired';
+			grTaskRequest.update();
+			this.createIncident(grTaskRequest, grCDSLog.u_payload);
+		}
+	},
+
+	type: 'cs_cds_utils'
+};
+]]></script>
+        <sys_class_name>sys_script_include</sys_class_name>
+        <sys_created_by>admin</sys_created_by>
+        <sys_created_on>2019-10-28 11:17:34</sys_created_on>
+        <sys_id>4f5dcf014ff0c41043a145dba310c75b</sys_id>
+        <sys_mod_count>0</sys_mod_count>
+        <sys_name>cds_utils</sys_name>
+        <sys_package display_value="NeedIt" source="x_58872_needit">6ead8e780f603200cd674f8ce1050ed1</sys_package>
+        <sys_policy>read</sys_policy>
+        <sys_scope display_value="NeedIt">6ead8e780f603200cd674f8ce1050ed1</sys_scope>
+        <sys_update_name>sys_script_include_4f5dcf014ff0c41043a145dba310c75b</sys_update_name>
+        <sys_updated_by>admin</sys_updated_by>
+        <sys_updated_on>2019-10-28 11:17:34</sys_updated_on>
+    </sys_script_include>
+</record_update>
